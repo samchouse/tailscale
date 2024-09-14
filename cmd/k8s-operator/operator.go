@@ -22,6 +22,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
@@ -39,6 +40,7 @@ import (
 	"tailscale.com/ipn"
 	"tailscale.com/ipn/store/kubestore"
 	tsapi "tailscale.com/k8s-operator/apis/v1alpha1"
+	"tailscale.com/kube/kubetypes"
 	"tailscale.com/tsnet"
 	"tailscale.com/tstime"
 	"tailscale.com/types/logger"
@@ -51,7 +53,8 @@ import (
 // Generate static manifests for deploying Tailscale operator on Kubernetes from the operator's Helm chart.
 //go:generate go run tailscale.com/cmd/k8s-operator/generate staticmanifests
 
-// TODO (irbekrm): generate CRD docs from the yamls
+// Generate CRD API docs.
+//go:generate go run github.com/elastic/crd-ref-docs --renderer=markdown --source-path=../../k8s-operator/apis/ --config=../../k8s-operator/api-docs-config.yaml --output-path=../../k8s-operator/api.md
 
 func main() {
 	// Required to use our client API. We're fine with the instability since the
@@ -65,6 +68,7 @@ func main() {
 		priorityClassName     = defaultEnv("PROXY_PRIORITY_CLASS_NAME", "")
 		tags                  = defaultEnv("PROXY_TAGS", "tag:k8s")
 		tsFirewallMode        = defaultEnv("PROXY_FIREWALL_MODE", "")
+		defaultProxyClass     = defaultEnv("PROXY_DEFAULT_CLASS", "")
 		isDefaultLoadBalancer = defaultBool("OPERATOR_DEFAULT_LOAD_BALANCER", false)
 	)
 
@@ -85,9 +89,9 @@ func main() {
 	// https://tailscale.com/kb/1236/kubernetes-operator/?q=kubernetes#accessing-the-kubernetes-control-plane-using-an-api-server-proxy.
 	mode := parseAPIProxyMode()
 	if mode == apiserverProxyModeDisabled {
-		hostinfo.SetApp("k8s-operator")
+		hostinfo.SetApp(kubetypes.AppOperator)
 	} else {
-		hostinfo.SetApp("k8s-operator-proxy")
+		hostinfo.SetApp(kubetypes.AppAPIServerProxy)
 	}
 
 	s, tsClient := initTSNet(zlog)
@@ -105,6 +109,7 @@ func main() {
 		proxyActAsDefaultLoadBalancer: isDefaultLoadBalancer,
 		proxyTags:                     tags,
 		proxyFirewallMode:             tsFirewallMode,
+		proxyDefaultClass:             defaultProxyClass,
 	}
 	runReconcilers(rOpts)
 }
@@ -237,6 +242,8 @@ func runReconcilers(opts reconcilerOpts) {
 				&appsv1.StatefulSet{}:        nsFilter,
 				&appsv1.Deployment{}:         nsFilter,
 				&discoveryv1.EndpointSlice{}: nsFilter,
+				&rbacv1.Role{}:               nsFilter,
+				&rbacv1.RoleBinding{}:        nsFilter,
 			},
 		},
 		Scheme: tsapi.GlobalScheme,
@@ -278,6 +285,7 @@ func runReconcilers(opts reconcilerOpts) {
 			recorder:              eventRecorder,
 			tsNamespace:           opts.tailscaleNamespace,
 			clock:                 tstime.DefaultClock{},
+			proxyDefaultClass:     opts.proxyDefaultClass,
 		})
 	if err != nil {
 		startlog.Fatalf("could not create service reconciler: %v", err)
@@ -296,10 +304,11 @@ func runReconcilers(opts reconcilerOpts) {
 		Watches(&corev1.Service{}, svcHandlerForIngress).
 		Watches(&tsapi.ProxyClass{}, proxyClassFilterForIngress).
 		Complete(&IngressReconciler{
-			ssr:      ssr,
-			recorder: eventRecorder,
-			Client:   mgr.GetClient(),
-			logger:   opts.log.Named("ingress-reconciler"),
+			ssr:               ssr,
+			recorder:          eventRecorder,
+			Client:            mgr.GetClient(),
+			logger:            opts.log.Named("ingress-reconciler"),
+			proxyDefaultClass: opts.proxyDefaultClass,
 		})
 	if err != nil {
 		startlog.Fatalf("could not create ingress reconciler: %v", err)
@@ -383,6 +392,28 @@ func runReconcilers(opts reconcilerOpts) {
 	if err != nil {
 		startlog.Fatalf("could not create DNS records reconciler: %v", err)
 	}
+
+	// Recorder reconciler.
+	recorderFilter := handler.EnqueueRequestForOwner(mgr.GetScheme(), mgr.GetRESTMapper(), &tsapi.Recorder{})
+	err = builder.ControllerManagedBy(mgr).
+		For(&tsapi.Recorder{}).
+		Watches(&appsv1.StatefulSet{}, recorderFilter).
+		Watches(&corev1.ServiceAccount{}, recorderFilter).
+		Watches(&corev1.Secret{}, recorderFilter).
+		Watches(&rbacv1.Role{}, recorderFilter).
+		Watches(&rbacv1.RoleBinding{}, recorderFilter).
+		Complete(&RecorderReconciler{
+			recorder:    eventRecorder,
+			tsNamespace: opts.tailscaleNamespace,
+			Client:      mgr.GetClient(),
+			l:           opts.log.Named("recorder-reconciler"),
+			clock:       tstime.DefaultClock{},
+			tsClient:    opts.tsClient,
+		})
+	if err != nil {
+		startlog.Fatalf("could not create Recorder reconciler: %v", err)
+	}
+
 	startlog.Infof("Startup complete, operator running, version: %s", version.Long())
 	if err := mgr.Start(signals.SetupSignalHandler()); err != nil {
 		startlog.Fatalf("could not start manager: %v", err)
@@ -423,6 +454,10 @@ type reconcilerOpts struct {
 	// Auto is usually the best choice, unless you want to explicitly set
 	// specific mode for debugging purposes.
 	proxyFirewallMode string
+	// proxyDefaultClass is the name of the ProxyClass to use as the default
+	// class for proxies that do not have a ProxyClass set.
+	// this is defined by an operator env variable.
+	proxyDefaultClass string
 }
 
 // enqueueAllIngressEgressProxySvcsinNS returns a reconcile request for each
@@ -515,6 +550,7 @@ func dnsRecordsReconcilerIngressHandler(ns string, isDefaultLoadBalancer bool, c
 
 type tsClient interface {
 	CreateKey(ctx context.Context, caps tailscale.KeyCapabilities) (string, *tailscale.Key, error)
+	Device(ctx context.Context, deviceID string, fields *tailscale.DeviceFieldsOpts) (*tailscale.Device, error)
 	DeleteDevice(ctx context.Context, nodeStableID string) error
 }
 
